@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Site Mirror</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body class="popup">
+  <header>
+    <img src="icons/icon32.png" alt="" width="20" height="20">
+    <h1>Site Mirror</h1>
+  </header>
+
+  <p class="hint">Records this tab's HTML, CSS, JS, images, fonts and the data its scripts load, so it can be replayed offline exactly as it was.</p>
+
+  <h2>Pages</h2>
+  <fieldset>
+    <label><input type="radio" name="scope" value="page" checked> This page only</label>
+    <label><input type="radio" name="scope" value="crawl"> Follow links on this site</label>
+    <div class="crawl">
+      <label>Up to <input type="number" id="maxPages" min="1" max="1000" value="20"> pages,</label>
+      <label><input type="number" id="maxDepth" min="1" max="20" value="2"> links deep</label>
+      <label><input type="checkbox" id="samePath"> Only under the current folder</label>
+    </div>
+  </fieldset>
+
+  <h2>Options</h2>
+  <fieldset>
+    <label><input type="checkbox" id="scroll" checked> Scroll each page (loads lazy content)</label>
+    <label><input type="checkbox" id="thirdParty" checked> Include other sites' files (CDNs, fonts, APIs)</label>
+    <label>Wait <input type="number" id="quiet" min="0.5" max="30" step="0.5" value="2"> s of network silence per page</label>
+  </fieldset>
+
+  <div class="buttons"><button id="start">Copy site</button></div>
+
+  <p class="note">The page is reloaded while it is recorded, with your session. Chrome shows a "started debugging this browser" bar meanwhile.</p>
+
+  <div id="status" class="status" role="status" aria-live="polite"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

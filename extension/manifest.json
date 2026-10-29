@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "Site Mirror",
+  "version": "0.0.0",
+  "description": "Copy a website with its HTML, CSS, JS, images and data, then replay it offline exactly as it was.",
+  "minimum_chrome_version": "125",
+  "permissions": [
+    "activeTab",
+    "debugger"
+  ],
+  "action": {
+    "default_title": "Site Mirror",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

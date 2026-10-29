@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>About the fixture shop</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <h1>About</h1>
+  <p id="about-data"></p>
+  <a href="/">Home</a>
+  <script>
+    fetch('/api/about').then((r) => r.text()).then((t) => (document.getElementById('about-data').textContent = t));
+  </script>
+</body>
+</html>

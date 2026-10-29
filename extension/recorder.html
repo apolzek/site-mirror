@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Site Mirror - recording</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <img src="icons/icon32.png" alt="" width="20" height="20">
+    <h1>Site Mirror</h1>
+  </header>
+  <div class="url" id="startUrl"></div>
+
+  <div class="stats">
+    <div><b id="pageCount">0</b><span>pages</span></div>
+    <div><b id="responses">0</b><span>responses</span></div>
+    <div><b id="size">0 B</b><span>recorded</span></div>
+    <div><b id="failed">0</b><span>failed</span></div>
+  </div>
+
+  <h2>Pages</h2>
+  <ol class="pages" id="pages"></ol>
+
+  <div class="buttons">
+    <button id="stop">Stop and save</button>
+    <button id="cancel" class="secondary">Cancel</button>
+  </div>
+
+  <div id="status" class="status" role="status" aria-live="polite"></div>
+  <pre class="howto" id="howto" hidden></pre>
+
+  <script src="recorder.js"></script>
+</body>
+</html>
