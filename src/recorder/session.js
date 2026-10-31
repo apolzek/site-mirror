@@ -54,6 +54,7 @@ export class Recorder {
     this.pending = new Set(); // body fetches in flight
     this.lastActivity = Date.now();
     this.loadWaiters = [];
+    this.frames = new Set(); // sessionIds of attached cross-origin iframes
     this.handleEvent = this.handleEvent.bind(this);
     this.handleDetach = this.handleDetach.bind(this);
   }
@@ -116,7 +117,11 @@ export class Recorder {
 
     switch (method) {
       case 'Target.attachedToTarget':
+        if (params.targetInfo && params.targetInfo.type === 'iframe') this.frames.add(params.sessionId);
         this.setupSession(params.sessionId);
+        break;
+      case 'Target.detachedFromTarget':
+        this.frames.delete(params.sessionId);
         break;
       case 'Page.loadEventFired':
         if (!sessionId) {
@@ -239,17 +244,125 @@ export class Recorder {
   }
 
   /** Runs a page function (with JSON arguments) in the page and returns its JSON result. */
-  async evaluate(fn, ...args) {
-    const res = await this.send('Runtime.evaluate', {
-      expression: `(${fn})(...${JSON.stringify(args)})`,
-      awaitPromise: true,
-      returnByValue: true,
-      userGesture: true,
-    });
+  evaluate(fn, ...args) {
+    return this.evaluateIn(undefined, fn, args);
+  }
+
+  /**
+   * Runs a page function in every frame of the tab, cross-origin ones included, in an
+   * isolated world (the frame's DOM, out of the page's scripts' way). Frames that fail
+   * are skipped.
+   */
+  async evaluateEverywhere(fn, ...args) {
+    const results = [];
+    for (const sessionId of [undefined, ...this.frames]) {
+      let tree;
+      try {
+        ({ frameTree: tree } = await this.send('Page.getFrameTree', {}, sessionId));
+      } catch {
+        continue;
+      }
+      const frames = [];
+      const walk = (node) => {
+        frames.push(node.frame.id);
+        for (const child of node.childFrames || []) walk(child);
+      };
+      walk(tree);
+      for (const frameId of frames) {
+        try {
+          const { executionContextId } = await this.send('Page.createIsolatedWorld', { frameId, worldName: 'site-mirror' }, sessionId);
+          results.push(await this.evaluateIn(sessionId, fn, args, executionContextId));
+        } catch {
+          /* frame gone, or out of process (handled through its own session) */
+        }
+      }
+    }
+    return results;
+  }
+
+  async evaluateIn(sessionId, fn, args = [], contextId = undefined) {
+    const res = await this.send(
+      'Runtime.evaluate',
+      { expression: `(${fn})(...${JSON.stringify(args)})`, awaitPromise: true, returnByValue: true, userGesture: true, contextId },
+      sessionId
+    );
     if (res.exceptionDetails) {
       const d = res.exceptionDetails;
       throw new Error((d.exception && d.exception.description) || d.text);
     }
     return res.result.value;
+  }
+
+  /** The tab as it is now, iframes included, as an MHTML document. */
+  async snapshot() {
+    const { data } = await this.send('Page.captureSnapshot', { format: 'mhtml' });
+    return data;
+  }
+
+  /** Cookies scripts can read (not HttpOnly) for `url`. */
+  async scriptCookies(url) {
+    const { cookies } = await this.send('Network.getCookies', { urls: [url] });
+    return cookies.filter((c) => !c.httpOnly).map(({ name, value }) => ({ name, value }));
+  }
+
+  /**
+   * Adds the responses the site keeps in CacheStorage for `origins`. Pages read those
+   * without going to the network (icons, offline data), so the recording never saw them.
+   */
+  async recordCacheStorage(origins, { maxBytes = 200 * MB } = {}) {
+    const recorded = new Set(this.entries.filter((e) => e.method === 'GET').map((e) => e.url));
+    let added = 0;
+    for (const securityOrigin of origins) {
+      let caches = [];
+      try {
+        ({ caches } = await this.send('CacheStorage.requestCacheNames', { securityOrigin }));
+      } catch {
+        continue;
+      }
+      for (const cache of caches) {
+        for (let skip = 0; skip < 5000; skip += 200) {
+          const { cacheDataEntries } = await this.send('CacheStorage.requestEntries', {
+            cacheId: cache.cacheId,
+            skipCount: skip,
+            pageSize: 200,
+          });
+          for (const entry of cacheDataEntries) {
+            const url = entry.requestURL.replace(/#.*$/, '');
+            if (!isRecordable(url) || recorded.has(url) || (entry.requestMethod || 'GET') !== 'GET') continue;
+            if (this.bytes > maxBytes) return added;
+            if (!this.thirdParty && this.origin && new URL(url).origin !== this.origin) continue;
+            let body = null;
+            try {
+              const res = await this.send('CacheStorage.requestCachedResponse', {
+                cacheId: cache.cacheId,
+                requestURL: entry.requestURL,
+                requestHeaders: entry.requestHeaders,
+              });
+              body = decodeBody(res.response.body, true);
+            } catch {
+              continue;
+            }
+            const headers = cleanHeaders(Object.fromEntries(entry.responseHeaders.map((h) => [h.name, h.value])));
+            this.entries.push({
+              method: 'GET',
+              url,
+              type: 'CacheStorage',
+              time: Math.round(entry.responseTime * 1000) || Date.now(),
+              status: entry.responseStatus || 200,
+              statusText: entry.responseStatusText || '',
+              mimeType: (headers['content-type'] || '').split(';')[0].trim(),
+              headers,
+              body,
+            });
+            recorded.add(url);
+            this.bytes += body.length;
+            added++;
+          }
+          if (cacheDataEntries.length < 200) break;
+        }
+      }
+    }
+    this.onChange();
+    return added;
   }
 }

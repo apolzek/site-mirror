@@ -3,6 +3,7 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { unzip } from '../unit/helpers/unzip.js';
 import { expect, test } from './extension.js';
 import { CDN, ORIGIN, startSites } from './sites.mjs';
@@ -40,13 +41,23 @@ test('a crawled site replays offline with the data it had', async ({ context, mi
   let replay;
   try {
     const page = await context.newPage();
+    // State the user has before copying: a theme, a cookie, something typed, a cached icon.
     await page.goto(`${ORIGIN}/`);
+    await page.evaluate(() => {
+      localStorage.setItem('theme', 'dark');
+      document.cookie = 'pref=blue; path=/';
+    });
+    await page.reload();
     await expect(page.locator('#items li')).toHaveCount(2);
+    await expect(page.locator('#cached')).toHaveJSProperty('naturalWidth', 24);
+    await page.fill('#note', 'typed by the user');
+    const shownTitle = await page.locator('#title').textContent();
 
     const { file, filename, pages } = await mirrorVia(page, { crawl: true, maxPages: 5, maxDepth: 2, quiet: 1 });
     expect(filename).toMatch(/^mirror_127\.0\.0\.1-4180_\d{4}-\d\d-\d\d_\d\d-\d\d-\d\d\.zip$/);
     expect(pages).toEqual([`${ORIGIN}/`, `${ORIGIN}/about.html`]);
     expect(sites.hits['/logout']).toBeUndefined(); // never follows logout links
+    expect(sites.hits['/cached.svg']).toBe(1); // later loads read it from CacheStorage
     // The tab is back on the start page.
     await expect(page).toHaveURL(`${ORIGIN}/`);
     await page.close();
@@ -70,6 +81,21 @@ test('a crawled site replays offline with the data it had', async ({ context, mi
     expect(fs.existsSync(path.join(dir, 'files/127.0.0.1_4180/index.html'))).toBe(true);
     expect(fs.existsSync(path.join(dir, 'files/127.0.0.1_4181/photo.svg'))).toBe(true);
     expect(manifest.entries.some((e) => e.url === `${CDN}/photo.svg`)).toBe(true); // loaded by the scroll
+    expect(manifest.entries.find((e) => e.url === `${ORIGIN}/cached.svg`).type).toBe('CacheStorage');
+    expect(manifest.storage.local.theme).toBe('dark');
+    expect(manifest.storage.cookies).toContainEqual({ name: 'pref', value: 'blue' });
+    expect(manifest.pages.map((p) => p.snapshot)).toEqual(['snapshot.mhtml', 'snapshots/02-about.html.mhtml']);
+
+    // The snapshot is the tab exactly as the user left it: before the recorder reloaded it,
+    // with what was typed and what the canvases (also in a cross-origin iframe) showed.
+    const still = await context.newPage();
+    await still.goto(pathToFileURL(path.join(dir, 'snapshot.mhtml')).href);
+    await expect(still.locator('#title')).toHaveText(shownTitle);
+    await expect(still.locator('#note')).toHaveValue('typed by the user');
+    expect(await still.locator('#chart').evaluate((c) => getComputedStyle(c).backgroundImage)).toMatch(/^url\("data:image\/png/);
+    const frame = still.frames().find((f) => f !== still.mainFrame());
+    expect(await frame.locator('#c').evaluate((c) => getComputedStyle(c).backgroundImage)).toMatch(/^url\("data:image\/png/);
+    await still.close();
 
     replay = startReplay(dir);
     await replay.ready;
@@ -83,6 +109,10 @@ test('a crawled site replays offline with the data it had', async ({ context, mi
     await expect(mirror.locator('.logo')).toHaveJSProperty('naturalWidth', 40);
     expect(await mirror.evaluate(() => getComputedStyle(document.body).backgroundColor)).toBe('rgb(250, 240, 230)');
     expect(await mirror.locator('#cdn').evaluate((el) => getComputedStyle(el).color)).toBe('rgb(1, 2, 3)');
+    // The storage, cookie and cached files the page had.
+    await expect(mirror.locator('body')).toHaveAttribute('data-theme', 'dark');
+    await expect(mirror.locator('#pref')).toHaveText('blue');
+    await expect(mirror.locator('#cached')).toHaveJSProperty('naturalWidth', 24);
 
     // The page saw the recording's clock, not today's.
     const docTime = manifest.entries.find((e) => e.type === 'Document' && e.url === `${ORIGIN}/`).time;

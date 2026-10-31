@@ -5,7 +5,17 @@ import serveSource from '../../replay/serve.mjs?text';
 import { downloadBlob } from '../shared/download.js';
 import { makeFilename } from '../shared/filename.js';
 import { buildArchive } from './archive.js';
-import { fetchIcons, filterLinks, normalizePageUrl, pageInfo, pageLinks, scrollPage } from './crawl.js';
+import {
+  fetchIcons,
+  filterLinks,
+  freezePage,
+  normalizePageUrl,
+  pageInfo,
+  pageLinks,
+  pageStorage,
+  scrollPage,
+  thawPage,
+} from './crawl.js';
 import { Recorder } from './session.js';
 
 const VERSION = chrome.runtime.getManifest().version;
@@ -39,7 +49,9 @@ const options = {
 
 let stopRequested = false;
 let cancelled = false;
-const pages = []; // { url, title, status }
+const pages = []; // { url, title, status, snapshot (MHTML text) }
+let storage = null; // the start page's localStorage, sessionStorage and script cookies
+let firstSnapshot = null; // the tab as the user saw it, before it is reloaded
 
 const recorder = new Recorder(tabId, { thirdParty: options.thirdParty, onChange: render });
 
@@ -59,9 +71,19 @@ function addPageRow(url) {
   return li;
 }
 
+/** MHTML of the tab as it is now, with canvases and form values written into the DOM. */
+async function takeSnapshot() {
+  await recorder.evaluateEverywhere(freezePage);
+  try {
+    return await recorder.snapshot();
+  } finally {
+    await recorder.evaluateEverywhere(thawPage);
+  }
+}
+
 async function recordPage(url) {
   const row = addPageRow(url);
-  const page = { url, title: '', status: 'ok' };
+  const page = { url, title: '', status: 'ok', snapshot: pages.length === 0 ? firstSnapshot : null };
   pages.push(page);
   render();
   try {
@@ -75,6 +97,10 @@ async function recordPage(url) {
     }
     const info = await recorder.evaluate(pageInfo);
     page.title = info.title;
+    if (!page.snapshot) {
+      setStatus('Saving a snapshot of the page...');
+      page.snapshot = await takeSnapshot().catch(() => null);
+    }
     if (normalizePageUrl(info.url) !== url) page.finalUrl = info.url;
     row.title = info.title;
     return true;
@@ -112,6 +138,7 @@ async function save(startedAt) {
     entries: recorder.entries,
     pages,
     startUrl,
+    storage,
     startedAt,
     finishedAt: Date.now(),
     version: VERSION,
@@ -122,8 +149,9 @@ async function save(startedAt) {
   const folder = filename.replace(/\.zip$/, '');
   $('howto').hidden = false;
   $('howto').textContent =
-    `To replay it:\n  unzip ${filename} -d ${folder}\n  cd ${folder} && node serve.mjs\n` +
-    `then open http://localhost:8080${new URL(startUrl).pathname}`;
+    `To see the page exactly as it was:\n  unzip ${filename} -d ${folder}\n  open ${folder}/snapshot.mhtml in Chrome\n\n` +
+    `To use the site offline (links, data, scripts):\n  cd ${folder} && node serve.mjs\n` +
+    `  then open http://localhost:8080${new URL(startUrl).pathname}${new URL(startUrl).search}`;
   return { filename, size: blob.size, files, entries };
 }
 
@@ -151,8 +179,21 @@ async function run() {
   recorder.origin = new URL(startUrl).origin;
   $('startUrl').textContent = startUrl;
   document.title = `Site Mirror - ${new URL(startUrl).host}`;
+  // Before anything reloads the tab: what the user is looking at, and the state behind it.
+  try {
+    setStatus('Saving the page as it is on screen...');
+    storage = { ...(await recorder.evaluate(pageStorage)), cookies: await recorder.scriptCookies(startUrl) };
+    firstSnapshot = await takeSnapshot();
+  } catch {
+    /* the page is still loading or blocks scripts: the crawl snapshots it after loading */
+  }
   try {
     await crawl();
+    if (!recorder.detachReason && !cancelled) {
+      setStatus('Reading the site cache...');
+      const origins = new Set(recorder.entries.filter((e) => e.type === 'Document').map((e) => new URL(e.url).origin));
+      await recorder.recordCacheStorage(origins).catch(() => {});
+    }
   } finally {
     // Leave the tab where the user started.
     recorder.recording = false;
@@ -174,6 +215,7 @@ async function run() {
     const failedPages = pages.filter((p) => p.status !== 'ok').length;
     const notes = [];
     if (failedPages) notes.push(`${failedPages} page(s) failed`);
+    if (recorder.failed) notes.push(`${recorder.failed} request(s) failed while recording, the copy may miss them; copy again if the page looked wrong`);
     if (recorder.detachReason && recorder.detachReason !== 'finished') notes.push(`stopped early: ${recorder.detachReason}`);
     setStatus(
       `Saved ${result.filename} (${pages.length} page(s), ${result.entries} responses, ${formatSize(result.size)})` +

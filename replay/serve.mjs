@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 // Site Mirror replay server: serves a recording exactly as it was captured.
 //
-//   node serve.mjs [--port 8080] [--host 127.0.0.1] [--no-freeze-time] [--dir <recording>]
+//   node serve.mjs [--port 8080] [--host 127.0.0.1] [--no-freeze-time] [--strict] [--dir <recording>]
 //
 // Requests to this server stand for requests to the recorded site. A service worker
 // (/__mirror/sw.js) sends the requests the page makes to other origins (CDNs, APIs,
-// fonts) here as well, so nothing goes to the network. Every request is answered from
+// fonts) here as well, as /__mirror/o/<scheme>/<host>/<path>, so nothing goes to the
+// network and relative URLs inside those files still resolve. Every request is answered from
 // mirror.json: exact match first, then the closest recorded request for the same path.
+// The page starts with the localStorage, sessionStorage and cookies it had when recorded.
 //
 // Single file, no dependencies: it is copied into every recording.
 
@@ -66,6 +68,9 @@ export function queryScore(a, b) {
   return score;
 }
 
+const hasBody = (e) =>
+  !!e.file || e.status === 204 || e.status === 304 || (e.status >= 300 && e.status < 400) || (e.headers || {})['content-length'] === '0';
+
 /**
  * Index over the recorded entries.
  * lookup(method, url, body) -> entry | null
@@ -84,6 +89,10 @@ export function createIndex(entries) {
   let cursors = new Map();
 
   function pick(list, body) {
+    // A response whose body Chrome no longer had is recorded without one; another
+    // recording of the same request is better.
+    const complete = list.filter(hasBody);
+    if (complete.length && complete.length < list.length) list = complete;
     if (list.length > 1 && body !== undefined) {
       const same = list.filter((e) => (e.postData || '') === body);
       if (same.length) list = same;
@@ -122,6 +131,20 @@ export function createIndex(entries) {
 }
 
 // ---------------------------------------------------------------------------------------
+// Other origins on the mirror: https://cdn.io/a/b.css?v=1 <-> /__mirror/o/https/cdn.io/a/b.css?v=1
+
+export function mirrorPath(url) {
+  const u = new URL(url);
+  return `${MIRROR}o/${u.protocol.slice(0, -1)}/${u.host}${u.pathname}${u.search}`;
+}
+
+/** The original URL of a /__mirror/o/ path (with its query), or null. */
+export function fromMirrorPath(pathname, search = '') {
+  const m = new RegExp(`^${MIRROR}o/(https?)/([^/]+)(/.*)?$`).exec(pathname);
+  return m ? `${m[1]}://${m[2]}${m[3] || '/'}${search}` : null;
+}
+
+// ---------------------------------------------------------------------------------------
 // Rewriting documents
 
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -140,7 +163,7 @@ export function rewriteHtml(html, { origin, time }) {
     .replace(new RegExp(`(?:https?:)?${escapeRe(host.replace(/\//g, '\\/'))}(?=\\\\/)`, 'g'), '')
     .replace(/(<iframe\b[^>]*?\ssrc\s*=\s*)(["'])(https?:\/\/[^"']+)\2/gi, (m, pre, q, src) => {
       const raw = src.replace(/&amp;/g, '&');
-      return `${pre}${q}${MIRROR}raw?url=${encodeURIComponent(raw)}${q}`;
+      return `${pre}${q}${mirrorPath(raw).replace(/&/g, '&amp;')}${q}`;
     });
   const tag = `<script src="${MIRROR}client.js${time ? `?t=${time}` : ''}"></script>`;
   const head = /<head\b[^>]*>/i.exec(out);
@@ -159,15 +182,36 @@ export function rewriteLocation(location, base, origin) {
     return location;
   }
   if (u.origin === origin) return u.pathname + u.search + u.hash;
-  return `${MIRROR}raw?url=${encodeURIComponent(u.href)}`;
+  return mirrorPath(u.href);
 }
 
 // ---------------------------------------------------------------------------------------
 // Scripts served to the replayed page
 
-/** Runs first in every replayed document. */
-export function clientScript(cookieName) {
+/**
+ * Runs first in every replayed document. `seed` ({ id, local, session, cookies }) is the
+ * recorded storage: localStorage is reset to it once per recording (later changes made in
+ * the mirror are kept), sessionStorage once per tab.
+ */
+export function clientScript(cookieName, seed = null) {
   return `(function () {
+  var seed = ${JSON.stringify(seed).replace(/</g, '\\u003c')};
+  if (seed) {
+    try {
+      if (localStorage.getItem('__mirror_seed') !== seed.id) {
+        localStorage.clear();
+        for (var k in seed.local) localStorage.setItem(k, seed.local[k]);
+        localStorage.setItem('__mirror_seed', seed.id);
+        (seed.cookies || []).forEach(function (c) {
+          document.cookie = c.name + '=' + c.value + '; path=/; SameSite=Lax';
+        });
+      }
+      if (sessionStorage.getItem('__mirror_seed') !== seed.id) {
+        for (var s in seed.session) sessionStorage.setItem(s, seed.session[s]);
+        sessionStorage.setItem('__mirror_seed', seed.id);
+      }
+    } catch (e) {}
+  }
   var src = (document.currentScript && document.currentScript.src) || '';
   var m = /[?&]t=(\\d+)/.exec(src);
   if (m) {
@@ -218,7 +262,9 @@ self.addEventListener('fetch', (event) => {
   const req = event.request;
   const url = new URL(req.url);
   if (url.origin === self.location.origin || !/^https?:$/.test(url.protocol) || req.mode === 'navigate') return;
-  const local = url.origin === ORIGIN ? url.pathname + url.search : '${MIRROR}raw?url=' + encodeURIComponent(url.href);
+  const local = url.origin === ORIGIN
+    ? url.pathname + url.search
+    : '${MIRROR}o/' + url.protocol.slice(0, -1) + '/' + url.host + url.pathname + url.search;
   event.respondWith((async () => {
     const init = { method: req.method, headers: req.headers, credentials: 'same-origin', redirect: 'follow' };
     if (req.method !== 'GET' && req.method !== 'HEAD') init.body = await req.arrayBuffer();
@@ -258,9 +304,17 @@ export function bootstrapHtml(cookieName) {
 // ---------------------------------------------------------------------------------------
 // Server
 
-export function createMirrorServer({ dir, freezeTime = true, port = 8080, log = console.log }) {
+// Paths that are files, not data: a miss on one of these is a 404 even outside --strict.
+const STATIC_PATH = /\.(js|mjs|css|png|jpe?g|gif|webp|avif|svg|ico|woff2?|ttf|otf|eot|wasm|map|html?|mp4|webm|mp3)$/i;
+
+export function createMirrorServer({ dir, freezeTime = true, strict = false, port = 8080, log = console.log }) {
   const manifest = JSON.parse(fs.readFileSync(path.join(dir, 'mirror.json'), 'utf8'));
   const { origin, entries } = manifest;
+  const { storage } = manifest;
+  const seed =
+    storage && storage.origin === origin
+      ? { id: manifest.startedAt, local: storage.local || {}, session: storage.session || {}, cookies: storage.cookies || [] }
+      : null;
   const index = createIndex(entries);
   const cookieName = `__mirror_${port}`;
   const startDocument =
@@ -307,11 +361,13 @@ export function createMirrorServer({ dir, freezeTime = true, port = 8080, log = 
       return send(res, 200, { 'content-type': 'text/javascript', 'service-worker-allowed': '/' }, serviceWorkerScript(origin));
     }
     if (local.pathname === `${MIRROR}client.js`) {
-      return send(res, 200, { 'content-type': 'text/javascript' }, clientScript(cookieName));
+      return send(res, 200, { 'content-type': 'text/javascript' }, clientScript(cookieName, seed));
     }
 
-    let target;
-    if (local.pathname === `${MIRROR}raw`) {
+    let target = fromMirrorPath(local.pathname, local.search);
+    if (target) {
+      target = target.replace(/#.*$/, '');
+    } else if (local.pathname === `${MIRROR}raw`) {
       target = local.searchParams.get('url') || '';
       try {
         target = new URL(target).href.replace(/#.*$/, '');
@@ -334,9 +390,28 @@ export function createMirrorServer({ dir, freezeTime = true, port = 8080, log = 
     const body = req.method === 'GET' || req.method === 'HEAD' ? undefined : await readBody(req);
     const entry = index.lookup(req.method, target, body);
     if (entry) return serveEntry(req, res, entry, target, entry.url === target ? '' : `closest: ${entry.url}`);
+    // A root-relative URL ("/x.js") asked for by a file from another origin means that origin.
+    let referer = null;
+    try {
+      const r = new URL(req.headers.referer || '');
+      referer = fromMirrorPath(r.pathname, r.search);
+    } catch {
+      /* no referer */
+    }
+    if (referer && new URL(target).origin === origin && new URL(referer).origin !== origin) {
+      const other = new URL(local.pathname + local.search, referer).href;
+      const found = index.lookup(req.method, other, body);
+      if (found) return serveEntry(req, res, found, other, `from ${new URL(referer).origin}`);
+    }
     if (document && startDocument && new URL(target).origin === origin) {
       // Client-side routes the crawl never loaded: let the app's router handle them.
       return serveEntry(req, res, startDocument, target, 'not recorded, served the start page');
+    }
+    if (!strict && req.headers['sec-fetch-dest'] === 'empty' && !STATIC_PATH.test(new URL(target).pathname)) {
+      // A data request the recording never made (a background ping, a click the user did
+      // not make): an empty answer keeps most apps quiet where a 404 shows an error.
+      log(`200 ${req.method} ${target} (not recorded, answered {})`);
+      return send(res, 200, { 'content-type': 'application/json', 'x-mirror': 'not recorded' }, '{}');
     }
     log(`404 ${req.method} ${target} (not recorded)`);
     return send(res, 404, { 'content-type': 'text/plain; charset=utf-8', 'x-mirror': 'not recorded' }, `Not in the recording: ${req.method} ${target}\n`);
@@ -362,9 +437,10 @@ function parseArgs(argv) {
     else if (a === '--host') opts.host = argv[++i];
     else if (a === '--dir') opts.dir = argv[++i];
     else if (a === '--no-freeze-time') opts.freezeTime = false;
+    else if (a === '--strict') opts.strict = true;
     else if (a === '--quiet') opts.quiet = true;
     else if (a === '--help' || a === '-h') {
-      console.log('usage: node serve.mjs [--port 8080] [--host 127.0.0.1] [--no-freeze-time] [--dir <recording>] [--quiet]');
+      console.log('usage: node serve.mjs [--port 8080] [--host 127.0.0.1] [--no-freeze-time] [--strict] [--dir <recording>] [--quiet]');
       process.exit(0);
     } else {
       console.error(`unknown option: ${a}`);

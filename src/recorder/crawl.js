@@ -89,3 +89,60 @@ export async function scrollPage(stepDelay) {
   }
   return scrollers.length;
 }
+
+/**
+ * Page function, run in every frame: writes what only lives in memory into the DOM, so a
+ * snapshot (MHTML) shows it. Canvas drawings become the canvas's background image, typed
+ * form values become attributes. thawPage() removes the canvas images again.
+ */
+export function freezePage() {
+  let canvases = 0;
+  for (const c of document.querySelectorAll('canvas:not([data-mirror-frozen])')) {
+    if (!c.width || !c.height) continue;
+    let url;
+    try {
+      url = c.toDataURL();
+    } catch {
+      continue; // tainted by cross-origin images
+    }
+    c.setAttribute('data-mirror-frozen', c.hasAttribute('style') ? `s${c.getAttribute('style')}` : '');
+    c.style.setProperty('background-image', `url("${url}")`, 'important');
+    c.style.setProperty('background-size', '100% 100%', 'important');
+    canvases++;
+  }
+  for (const el of document.querySelectorAll('input, textarea, select')) {
+    if (el.type === 'password' || el.type === 'file') continue;
+    if (el.tagName === 'TEXTAREA') el.textContent = el.value;
+    else if (el.tagName === 'SELECT') for (const o of el.options) o.toggleAttribute('selected', o.selected);
+    else if (el.type === 'checkbox' || el.type === 'radio') el.toggleAttribute('checked', el.checked);
+    else el.setAttribute('value', el.value);
+  }
+  return canvases;
+}
+
+/** Page function, run in every frame: undoes the canvas images of freezePage(). */
+export function thawPage() {
+  for (const c of document.querySelectorAll('canvas[data-mirror-frozen]')) {
+    const style = c.getAttribute('data-mirror-frozen');
+    if (style) c.setAttribute('style', style.slice(1));
+    else c.removeAttribute('style');
+    c.removeAttribute('data-mirror-frozen');
+  }
+}
+
+/** Page function: the origin's localStorage and sessionStorage, as they are now. */
+export function pageStorage() {
+  const dump = (storage) => {
+    const out = {};
+    try {
+      for (let i = 0; i < storage().length; i++) {
+        const key = storage().key(i);
+        out[key] = storage().getItem(key);
+      }
+    } catch {
+      /* storage blocked */
+    }
+    return out;
+  };
+  return { origin: location.origin, local: dump(() => localStorage), session: dump(() => sessionStorage) };
+}

@@ -4,7 +4,16 @@ import os from 'node:os';
 import path from 'node:path';
 import vm from 'node:vm';
 import { after, before, describe, it } from 'node:test';
-import { clientScript, createIndex, createMirrorServer, queryScore, rewriteHtml, rewriteLocation } from '../../replay/serve.mjs';
+import {
+  clientScript,
+  createIndex,
+  createMirrorServer,
+  fromMirrorPath,
+  mirrorPath,
+  queryScore,
+  rewriteHtml,
+  rewriteLocation,
+} from '../../replay/serve.mjs';
 
 const e = (method, url, extra = {}) => ({ method, url, status: 200, headers: {}, ...extra });
 
@@ -45,9 +54,28 @@ describe('createIndex', () => {
     assert.equal(index.lookup('GET', 'https://a.io/poll').id, 1);
   });
 
+  it('prefers a recording that kept its body', () => {
+    const index = createIndex([e('GET', 'https://cdn.io/f.woff2', { id: 'lost' }), e('GET', 'https://cdn.io/f.woff2', { id: 'ok', file: 'f' })]);
+    assert.equal(index.lookup('GET', 'https://cdn.io/f.woff2').id, 'ok');
+    const empty = createIndex([e('GET', 'https://a.io/ping', { status: 204, id: 1 })]);
+    assert.equal(empty.lookup('GET', 'https://a.io/ping').id, 1);
+  });
+
   it('scores queries', () => {
     assert.ok(queryScore('?a=1&b=2', '?a=1&b=2') > queryScore('?a=1&b=2', '?a=1&b=3'));
     assert.ok(queryScore('?a=1&b=3', '?a=1&b=2') > queryScore('?a=1', '?a=1&b=2&c=3'));
+  });
+});
+
+describe('mirrorPath', () => {
+  it('maps other origins to paths that keep relative URLs working', () => {
+    assert.equal(mirrorPath('https://cdn.io:8443/a/b.css?v=1'), '/__mirror/o/https/cdn.io:8443/a/b.css?v=1');
+    assert.equal(fromMirrorPath('/__mirror/o/https/cdn.io:8443/a/b.css', '?v=1'), 'https://cdn.io:8443/a/b.css?v=1');
+    assert.equal(fromMirrorPath('/__mirror/o/http/cdn.io'), 'http://cdn.io/');
+    assert.equal(fromMirrorPath('/__mirror/client.js'), null);
+    // ../fonts/x.woff2 from the stylesheet lands on the font of the same origin.
+    const css = `http://localhost${mirrorPath('https://cdn.io/build/app.css')}`;
+    assert.equal(fromMirrorPath(new URL('../fonts/x.woff2', css).pathname), 'https://cdn.io/fonts/x.woff2');
   });
 });
 
@@ -71,12 +99,12 @@ describe('rewriteHtml', () => {
 
   it('routes cross-origin iframes through the mirror', () => {
     const out = rewriteHtml('<head><iframe width="1" src="https://v.io/embed?a=1&amp;b=2"></iframe>', { origin, time: 0 });
-    assert.match(out, /src="\/__mirror\/raw\?url=https%3A%2F%2Fv\.io%2Fembed%3Fa%3D1%26b%3D2"/);
+    assert.match(out, /src="\/__mirror\/o\/https\/v\.io\/embed\?a=1&amp;b=2"/);
   });
 
   it('rewrites redirects', () => {
     assert.equal(rewriteLocation('/login?next=/', 'https://a.io/x', origin), '/login?next=/');
-    assert.equal(rewriteLocation('https://cdn.io/f.js', 'https://a.io/x', origin), '/__mirror/raw?url=https%3A%2F%2Fcdn.io%2Ff.js');
+    assert.equal(rewriteLocation('https://cdn.io/f.js', 'https://a.io/x', origin), '/__mirror/o/https/cdn.io/f.js');
   });
 });
 
@@ -106,6 +134,31 @@ describe('clientScript', () => {
     assert.equal(result.str, 'string');
     assert.equal(result.ctor, true);
   });
+
+  it('restores the recorded storage once per recording, keeping later changes', () => {
+    const store = () => {
+      const data = new Map();
+      return {
+        data,
+        getItem: (k) => (data.has(k) ? data.get(k) : null),
+        setItem: (k, v) => data.set(k, String(v)),
+        clear: () => data.clear(),
+      };
+    };
+    const context = { document: { cookie: '' }, navigator: {}, localStorage: store(), sessionStorage: store() };
+    context.window = context;
+    context.localStorage.setItem('stale', 'from another mirror');
+    vm.createContext(context);
+    const seed = { id: 'rec-1', local: { theme: 'dark' }, session: { tab: '2' }, cookies: [{ name: 'pref', value: 'blue' }] };
+    vm.runInContext(clientScript('__mirror_8080', seed), context);
+    assert.equal(context.localStorage.getItem('theme'), 'dark');
+    assert.equal(context.localStorage.getItem('stale'), null);
+    assert.equal(context.sessionStorage.getItem('tab'), '2');
+    assert.match(context.document.cookie, /pref=blue/);
+    context.localStorage.setItem('theme', 'light'); // changed in the mirror
+    vm.runInContext(clientScript('__mirror_8080', seed), context);
+    assert.equal(context.localStorage.getItem('theme'), 'light');
+  });
 });
 
 describe('createMirrorServer', () => {
@@ -124,7 +177,9 @@ describe('createMirrorServer', () => {
       JSON.stringify({
         startUrl: 'https://a.io/',
         origin: 'https://a.io',
+        startedAt: '2026-01-01T00:00:00.000Z',
         pages: [],
+        storage: { origin: 'https://a.io', local: { theme: 'dark' }, session: {}, cookies: [] },
         entries: [
           e('GET', 'https://a.io/', { type: 'Document', mimeType: 'text/html', time: 1234, file: 'files/index.html', headers: { 'content-type': 'text/html', 'content-security-policy': "default-src 'none'", 'content-encoding': 'gzip' } }),
           e('GET', 'https://a.io/data?ts=1', { type: 'Fetch', mimeType: 'application/json', file: 'files/data.json', headers: { 'content-type': 'application/json' } }),
@@ -163,7 +218,30 @@ describe('createMirrorServer', () => {
     assert.match(res.headers.get('x-mirror'), /closest/);
   });
 
-  it('serves other origins through /__mirror/raw', async () => {
+  it('serves other origins under /__mirror/o/', async () => {
+    const res = await fetch(`${base}/__mirror/o/https/cdn.io/lib.js`);
+    assert.equal(await res.text(), 'cdn()');
+    assert.equal(res.headers.get('set-cookie'), null);
+  });
+
+  it('resolves root-relative URLs from another origin\'s files against that origin', async () => {
+    const res = await fetch(`${base}/lib.js`, { headers: { referer: `${base}/__mirror/o/https/cdn.io/app/main.js` } });
+    assert.equal(await res.text(), 'cdn()');
+  });
+
+  it('answers unrecorded data requests with {}, or 404 for files', async () => {
+    const data = await fetch(`${base}/api/ping`, { headers: { 'sec-fetch-dest': 'empty' } });
+    assert.equal(data.status, 200);
+    assert.deepEqual(await data.json(), {});
+    assert.equal((await fetch(`${base}/icon.svg`, { headers: { 'sec-fetch-dest': 'empty' } })).status, 404);
+  });
+
+  it('seeds the recorded storage through the client script', async () => {
+    const text = await (await fetch(`${base}/__mirror/client.js`)).text();
+    assert.match(text, /"local":\{"theme":"dark"\}/);
+  });
+
+  it('still serves other origins through /__mirror/raw', async () => {
     const res = await fetch(`${base}/__mirror/raw?url=${encodeURIComponent('https://cdn.io/lib.js')}`);
     assert.equal(await res.text(), 'cdn()');
     assert.equal(res.headers.get('set-cookie'), null);

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { buildArchive, createPathAllocator, layoutArchive, shortHash } from '../../src/recorder/archive.js';
+import { buildArchive, completeSnapshot, createPathAllocator, layoutArchive, shortHash, snapshotPath } from '../../src/recorder/archive.js';
 import { unzipText } from './helpers/unzip.js';
 
 describe('createPathAllocator', () => {
@@ -94,5 +94,58 @@ describe('layoutArchive', () => {
     assert.equal(zip.get('files/x.io/index.html'), '<p>hi</p>');
     assert.match(zip.get('README.txt'), /node serve\.mjs/);
     assert.equal(JSON.parse(zip.get('mirror.json')).entries[0].file, 'files/x.io/index.html');
+  });
+});
+
+describe('completeSnapshot', () => {
+  const B = '----MultipartBoundary--abc----';
+  const mhtml = [
+    `From: <Saved by Blink>\r\nContent-Type: multipart/related;\r\n\ttype="text/html";\r\n\tboundary="${B}"\r\n\r\n`,
+    `--${B}\r\nContent-Type: text/html\r\nContent-Transfer-Encoding: quoted-printable\r\nContent-Location: https://a.io/\r\n\r\n`,
+    `<html><head><link rel=3D"stylesheet" href=3D"https://a.io/app.css"></head><body><img src=3D"logo.png"><b=\r\nutton>x</button></body></html>\r\n\r\n`,
+    `--${B}\r\nContent-Type: text/css\r\nContent-Transfer-Encoding: quoted-printable\r\nContent-Location: https://a.io/app.css\r\n\r\n`,
+    `@font-face { src: url("fonts/f.woff2"); } button:disabled { opacity: 0.3 } a:enabled{}\r\n\r\n`,
+    `--${B}--\r\n`,
+  ].join('');
+  const entry = (url, mimeType, type, body) => ({ method: 'GET', url, status: 200, mimeType, type, body: new Uint8Array(body) });
+  const part = (out, location) => {
+    const chunk = out.split(`--${B}`).find((c) => c.includes(`Content-Location: ${location}\r\n`));
+    return chunk && Buffer.from(chunk.split('\r\n\r\n')[1].replace(/\r\n/g, ''), 'base64');
+  };
+
+  it('adds the fonts and the images the page names, once', () => {
+    const out = completeSnapshot(mhtml, [
+      entry('https://a.io/fonts/f.woff2', 'font/woff2', 'Font', [1, 2, 3]),
+      entry('https://a.io/fonts/f.woff2', 'font/woff2', 'Font', [1, 2, 3]),
+      entry('https://a.io/logo.png', 'image/png', 'Image', [4, 5]),
+      entry('https://a.io/unused.png', 'image/png', 'Image', [6]),
+      entry('https://a.io/app.js', 'text/javascript', 'Script', [7]),
+    ]);
+    assert.deepEqual([...part(out, 'https://a.io/fonts/f.woff2')], [1, 2, 3]);
+    assert.deepEqual([...part(out, 'https://a.io/logo.png')], [4, 5]);
+    assert.equal(out.split('Content-Location: https://a.io/fonts/f.woff2').length, 2);
+    assert.equal(part(out, 'https://a.io/unused.png'), undefined);
+    assert.equal(part(out, 'https://a.io/app.js'), undefined);
+    assert.ok(out.endsWith(`--${B}--\r\n`));
+  });
+
+  it('asks for [disabled] instead of :disabled, which every control matches in MHTML', () => {
+    const out = completeSnapshot(mhtml, []);
+    const css = part(out, 'https://a.io/app.css').toString();
+    assert.match(css, /button\[disabled\] \{ opacity: 0\.3 \}/);
+    assert.match(css, /a:not\(\[disabled\]\)\{\}/);
+    assert.match(part(out, 'https://a.io/').toString(), /<button>x<\/button>/); // soft line break decoded
+  });
+
+  it('leaves anything that is not MHTML alone', () => {
+    assert.equal(completeSnapshot('<html></html>', []), '<html></html>');
+  });
+});
+
+describe('snapshotPath', () => {
+  it('names the start page snapshot.mhtml and numbers the others', () => {
+    assert.equal(snapshotPath(0, 'https://a.io/x'), 'snapshot.mhtml');
+    assert.equal(snapshotPath(1, 'https://a.io/docs/intro?lang=en'), 'snapshots/02-docs_intro_lang=en.mhtml');
+    assert.equal(snapshotPath(2, 'https://a.io/'), 'snapshots/03-index.mhtml');
   });
 });
